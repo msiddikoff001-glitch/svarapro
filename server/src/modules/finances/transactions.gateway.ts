@@ -8,7 +8,7 @@ import { Logger } from '@nestjs/common';
 
 @WebSocketGateway({
   cors: {
-    origin: 'https://svarapro.com', // Указываем точный origin
+    origin: '*',
   },
 })
 export class TransactionGateway {

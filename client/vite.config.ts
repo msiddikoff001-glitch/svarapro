@@ -56,6 +56,7 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 5173,
+    allowedHosts: true,
     proxy: {
       // Forward `/api/*` and `/socket.io/*` straight to the NestJS backend
       // without stripping the prefix. Nest mounts everything under
