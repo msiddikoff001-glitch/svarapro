@@ -50,6 +50,21 @@ type SocketUnsubscribe = () => void;
 
 const SOCKET_URL: string = import.meta.env?.VITE_SOCKET_URL ?? '';
 
+/**
+ * Resolve the socket-target URL. When `VITE_SOCKET_URL` is empty (the
+ * default in production where nginx proxies `/socket.io/` on the same
+ * origin as the static bundle), fall back to `window.location.origin`.
+ * Without this, `io('')` would short-circuit and the multiplayer flow
+ * (room snapshots + tick updates) would never reach the client.
+ */
+const resolveSocketUrl = (): string | null => {
+  if (SOCKET_URL && SOCKET_URL !== '/') return SOCKET_URL;
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return window.location.origin;
+  }
+  return null;
+};
+
 let socket: Socket | null = null;
 /** Listeners registered before the socket exists are replayed on connect. */
 const pendingListeners = new Map<string, Set<SocketHandler>>();
@@ -73,7 +88,8 @@ export function connectSocket(options: ConnectSocketOptions): void;
 export function connectSocket(
   arg: string | null | ConnectSocketOptions,
 ): void {
-  if (!SOCKET_URL) return;
+  const target = resolveSocketUrl();
+  if (!target) return;
   if (socket?.connected) return;
 
   const options: ConnectSocketOptions =
@@ -85,7 +101,7 @@ export function connectSocket(
   if (options.userData) auth.userData = options.userData;
 
   setStatus(CONNECTION_STATUS.connecting);
-  socket = io(SOCKET_URL, {
+  socket = io(target, {
     transports: ['websocket'],
     auth: Object.keys(auth).length > 0 ? auth : undefined,
     reconnection: true,

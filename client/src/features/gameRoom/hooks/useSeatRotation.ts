@@ -92,10 +92,27 @@ export function useSeatRotation({
     [],
   );
 
-  const aloneInRoom = useMemo(
-    () => (room?.players ?? 6) <= 1 && !spectator,
-    [room?.players, spectator],
-  );
+  // Count real seated players reported by the server. When the caller wires
+  // `otherSeats` (real multiplayer mode) we trust this count over the
+  // possibly-stale `room.players` field, so the dealing animation never
+  // kicks in until at least 2 humans are actually at the table.
+  const realPlayerCount = useMemo(() => {
+    if (!otherSeats) return null;
+    const filledOthers = Object.values(otherSeats).filter(
+      (o): o is SeatOverlayData => Boolean(o) && !o.empty,
+    ).length;
+    return filledOthers + (mySeat ? 1 : 0);
+  }, [otherSeats, mySeat]);
+
+  const aloneInRoom = useMemo(() => {
+    if (realPlayerCount != null) {
+      // In real multiplayer mode the spectator distinction stops mattering:
+      // a lone person sitting at the table (regardless of whether they're
+      // observing or playing) shouldn't see a phantom deal animation.
+      return realPlayerCount <= 1;
+    }
+    return (room?.players ?? 6) <= 1 && !spectator;
+  }, [realPlayerCount, room?.players, spectator]);
 
   const baseSeats = useMemo<RotationSeat[]>(() => {
     const defaults = SEATS_DEFAULT as RotationSeat[];
