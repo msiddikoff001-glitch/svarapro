@@ -10,6 +10,18 @@ import { GameService } from './services/game.service';
 import { RedisService } from '../../services/redis.service';
 import { UserDataDto } from './dto/user-data.dto';
 
+/**
+ * How long to wait between a socket disconnect and actually kicking
+ * the player out of their rooms. socket.io clients on flaky mobile
+ * networks (Telegram WebView, mobile Safari, tab-switching) drop and
+ * reconnect within a few seconds; this grace window lets the same
+ * `telegramId` re-join via `handleJoinRoom` and cancel the pending
+ * leave so other players don't see them ping in and out.
+ *
+ * Tuned to match the typical mobile reconnect (≤ 10s) plus headroom.
+ */
+const DISCONNECT_GRACE_PERIOD_MS = 20_000;
+
 @WebSocketGateway({
   cors: {
     origin: '*',
@@ -22,10 +34,33 @@ export class GameGateway implements OnGatewayDisconnect, OnGatewayInit {
   // Защита от дублирования действий
   private processingActions = new Map<string, boolean>();
 
+  /**
+   * Pending grace-period leave timers, keyed by `telegramId`. If the
+   * same player reconnects (i.e. emits `join_room` again) before the
+   * timer fires we cancel it and they stay seated.
+   */
+  private pendingDisconnects = new Map<string, NodeJS.Timeout>();
+
   constructor(
     private readonly gameService: GameService,
     private readonly redisService: RedisService,
   ) {}
+
+  /**
+   * Cancel any in-flight grace-period leave for `telegramId`. Called
+   * from `handleJoinRoom` so a reconnect within the window keeps the
+   * player seated. Safe to call when no timer is pending — just a
+   * no-op.
+   */
+  private cancelPendingDisconnect(telegramId: string): void {
+    const timer = this.pendingDisconnects.get(telegramId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.pendingDisconnects.delete(telegramId);
+    console.log(
+      `[disconnect-grace] ${telegramId} reconnected within ${DISCONNECT_GRACE_PERIOD_MS}ms, leave cancelled`,
+    );
+  }
 
   afterInit() {
     void this.redisService.subscribeToGameUpdates((roomId, gameState) => {
@@ -75,6 +110,11 @@ export class GameGateway implements OnGatewayDisconnect, OnGatewayInit {
     }
 
     void client.join(roomId);
+
+    // If this player had a pending grace-period leave (e.g. tab was
+    // briefly backgrounded), cancel it — they're back. Other players
+    // never see the leave, no rooms_updated churn.
+    this.cancelPendingDisconnect(telegramId);
 
     const result = await this.gameService.joinRoom(roomId, telegramId);
 
@@ -241,16 +281,71 @@ export class GameGateway implements OnGatewayDisconnect, OnGatewayInit {
       return;
     }
 
+    // Capture which rooms this player was in NOW (before the grace
+    // timer fires) — Redis state can change during the wait window
+    // (e.g. the player joins a different room from another tab) and
+    // we want the leave to apply to the rooms they were actually
+    // active in at disconnect time.
+    let roomIds: string[] = [];
     try {
-      const roomIds = await this.redisService.getPlayerRooms(telegramId);
-      if (roomIds && roomIds.length > 0) {
-        for (const roomId of roomIds) {
-          await this.gameService.leaveRoom(roomId, telegramId);
-        }
-      }
+      const fetched = await this.redisService.getPlayerRooms(telegramId);
+      if (Array.isArray(fetched)) roomIds = fetched;
     } catch (error) {
       console.error(
-        `[GEMINI] Error during disconnect cleanup for ${telegramId}:`,
+        `[disconnect-grace] failed to read rooms for ${telegramId}:`,
+        error,
+      );
+      return;
+    }
+
+    if (roomIds.length === 0) return;
+
+    // If a prior disconnect for the same telegramId is already
+    // pending, replace it — its captured rooms are stale.
+    const previous = this.pendingDisconnects.get(telegramId);
+    if (previous !== undefined) clearTimeout(previous);
+
+    console.log(
+      `[disconnect-grace] ${telegramId} disconnected from ${roomIds.length} room(s), will leave in ${DISCONNECT_GRACE_PERIOD_MS}ms unless reconnected`,
+    );
+
+    const timer = setTimeout(() => {
+      this.pendingDisconnects.delete(telegramId);
+      void this.performGracePeriodLeave(telegramId, roomIds);
+    }, DISCONNECT_GRACE_PERIOD_MS);
+
+    this.pendingDisconnects.set(telegramId, timer);
+  }
+
+  /**
+   * Actually kick the player out of their rooms after the grace
+   * period elapsed without a reconnect. Split out from
+   * `handleDisconnect` so the timeout callback can stay simple, and
+   * so failures in `leaveRoom` are logged with full context.
+   */
+  private async performGracePeriodLeave(
+    telegramId: string,
+    roomIds: readonly string[],
+  ): Promise<void> {
+    console.log(
+      `[disconnect-grace] ${telegramId} did not reconnect, leaving ${roomIds.length} room(s)`,
+    );
+    for (const roomId of roomIds) {
+      try {
+        await this.gameService.leaveRoom(roomId, telegramId);
+      } catch (error) {
+        console.error(
+          `[disconnect-grace] leaveRoom(${roomId}, ${telegramId}) failed:`,
+          error,
+        );
+      }
+    }
+    try {
+      const rooms = await this.gameService.getRooms();
+      this.server.emit('rooms_updated', rooms);
+    } catch (error) {
+      console.error(
+        `[disconnect-grace] failed to broadcast rooms_updated after ${telegramId} left:`,
         error,
       );
     }
