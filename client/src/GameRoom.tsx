@@ -296,20 +296,67 @@ export default function GameRoom({
       if (myServerSeatId !== null && seatId === myServerSeatId) continue;
       const pos = SEATID_TO_POS[seatId];
       if (!pos || pos === 'bottom') continue;
+      // Server balances are floats that often drift past 12 fractional
+      // digits (e.g. `$650.999999999999` after a `$1` ante is debited
+      // from `$651.00`). Round to two decimals and re-use the same
+      // `toLocaleString` formatting `mySeatOverlay` uses so the
+      // opponent nameplate doesn't look like a debug printout.
+      const stackStr =
+        typeof seat.stack === 'number'
+          ? `$${seat.stack.toLocaleString('en-US', { maximumFractionDigits: 2 })}`
+          : seat.stack;
       map[pos] = {
         name: seat.name,
-        stack: typeof seat.stack === 'number' ? `$${seat.stack}` : seat.stack,
+        stack: stackStr,
         photo: seat.photo,
       };
     }
     return map;
   }, [realSeats, SEATID_TO_POS, selfTelegramId, myServerSeatId]);
 
+  // ── Synthetic deal pulse ────────────────────────────────────────────
+  // The svarapro backend transitions from `ante` to `blind_betting`
+  // inside a single `publishGameUpdate`, so the client never sees a
+  // stable `phase === 'dealing'` window long enough to play the
+  // chip-toss + card-fly animation. Detect the `idle | round_end →
+  // betting` edge and synthesise a brief `dealing` window locally so
+  // the visual still fires for every new round.
+  //
+  // Suppressed when the first snapshot we see already has
+  // `phase === 'betting'` (mid-game reconnect / spectator join) so we
+  // don't fake a deal animation over a hand that's been on the felt
+  // for several seconds already.
+  const [localDealingPulse, setLocalDealingPulse] = useState<boolean>(false);
+  const prevServerPhaseRef = useRef<typeof serverPhase | null>(null);
+  useEffect(() => {
+    if (!serverDriven) {
+      prevServerPhaseRef.current = serverPhase;
+      return;
+    }
+    const prev = prevServerPhaseRef.current;
+    prevServerPhaseRef.current = serverPhase;
+    if (serverPhase !== 'betting') return;
+    if (prev !== 'idle' && prev !== 'round_end' && prev !== 'dealing') return;
+    setLocalDealingPulse(true);
+    // Drop the synthetic pulse after the chip toss + card fly + a
+    // turn-start beat. Tuned for 6 seats — caps out at ~5s, which is
+    // enough for the animation chain to set `dealingDone = true` on
+    // its own. After the pulse drops the forced-dealingDone effect
+    // below takes over so the action bar still appears even if the
+    // animation timing is off.
+    const id = setTimeout(() => setLocalDealingPulse(false), 5200);
+    return () => clearTimeout(id);
+  }, [serverDriven, serverPhase]);
+
   // When the wire is the source of truth, deal animation must follow
   // server `status === 'ante'` (mapped to `phase === 'dealing'`) rather
   // than the legacy `DEAL_START_DELAY_MS` setTimeout. `undefined` keeps
-  // the local timer alive for tests / no-server demo flows.
-  const dealingFromServer = serverDriven ? serverPhase === 'dealing' : undefined;
+  // the local timer alive for tests / no-server demo flows. The
+  // `localDealingPulse` lets us paint the animation even when the
+  // wire skips the intermediate phase (see above).
+  const dealingFromServer = serverDriven
+    ? serverPhase === 'dealing' || localDealingPulse
+    : undefined;
 
   const {
     seats,
@@ -725,8 +772,15 @@ export default function GameRoom({
       setMyAutoFolded(false);
       return;
     }
+    // While the synthetic deal pulse is running, the chained
+    // `cardsDealing` effect owns `dealingDone`. Forcing it true here
+    // would race the animation and the action bar would flash in
+    // mid-deal. Once the pulse drops the cardsDealing chain has
+    // already settled `dealingDone = true` itself (or this effect
+    // re-runs after the pulse ends and finishes the job).
+    if (localDealingPulse) return;
     setDealingDone(true);
-  }, [serverDriven, serverPhase]);
+  }, [serverDriven, serverPhase, localDealingPulse]);
 
   // Bump `anteRound` on the rising edge of `showDealing` — AnteOverlay
   // re-mounts under the new key and replays the chip-toss for the new round.
@@ -891,6 +945,18 @@ export default function GameRoom({
   const mySeat = seats.find((sx) => sx.me);
   const mySeatId: string | number | null = mySeat?.id ?? null;
   const mySeatKey: string | null = mySeatId == null ? null : String(mySeatId);
+
+  // True when the server's `currentPlayerIndex` (translated through the
+  // adapter and the rotation map into our local seat id) matches the
+  // local player's seat. Used to gate the action bar so opponents
+  // don't see Open / Blind / Pass / Call / Raise during their wait.
+  //
+  // Always `false` in mock mode (no server snapshot yet), but the
+  // legacy local code path drives `activeTurnSeatId` directly via the
+  // local dealing chain anyway — so the gate falls through naturally
+  // once `setActiveTurnSeatId(String(me.id))` fires there.
+  const isMyTurn =
+    mySeatKey !== null && activeTurnSeatId !== null && activeTurnSeatId === mySeatKey;
 
   const triggerBetFlight = useCallback((amount: number) => {
     if (mySeatId == null) return;
@@ -1791,14 +1857,14 @@ export default function GameRoom({
 
         {spectator ? (
           <SpectatorBar />
-        ) : cardsOpened ? (
+        ) : cardsOpened && isMyTurn ? (
           <PostOpenButtons
             callAmount={callAmount}
             onPass={handlePass}
             onCall={handleCall}
             onRaise={handleRaise}
           />
-        ) : dealingDone && !myAutoFolded ? (
+        ) : dealingDone && !myAutoFolded && isMyTurn ? (
           <ActionButtons
             blindAmount={blindAmount}
             onOpen={handleOpenCards}
