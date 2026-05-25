@@ -494,6 +494,15 @@ export default function GameRoom({
   // in a ref so the per-chip landing callback can read the final figure
   // without depending on the showdown effect's closure.
   const pendingPotRef = useRef<number>(0);
+  // Stores the winnerId for which we've already scheduled the winner
+  // sweep (the 800 ms → setWinnerSeatId → 1000 ms → setWinnerChipFlight
+  // chain inside the showdown winner effect below). The effect depends
+  // on `seats` and `SEATID_TO_POS` which can shift reference across
+  // unrelated re-renders, so without this guard the chain would be
+  // re-scheduled multiple times for the same showdown — manifesting as
+  // the bank-countdown animation playing twice (chips fly, counter
+  // jumps back to the full pot, then ticks down again).
+  const winnerSweepStartedRef = useRef<string | null>(null);
 
   // ── Ante animation ────────────────────────────────────────────────
   // Bumped every time `showDealing` flips true so AnteOverlay re-mounts under
@@ -646,18 +655,6 @@ export default function GameRoom({
     turnStartRef.current = performance.now() - initialElapsed;
     setTurnTimerProgress(initialRemainingMs / turnDurationMs);
 
-    // Sound + vibration on turn start. Guard with a ref so the chord only
-    // plays once per turn even if the effect runs twice (StrictMode, or
-    // synthetic re-renders that don't change `activeTurnSeatId`).
-    if (lastTurnSoundIdRef.current !== activeTurnSeatId) {
-      lastTurnSoundIdRef.current = activeTurnSeatId;
-      hapticTap();
-      if (audioRef.current?.soundRef.current) {
-        const ctx = audioRef.current.ensureCtx();
-        if (ctx) playTurnStartSound(ctx);
-      }
-    }
-
     const fireAutoPass = () => {
       if (autoPassedRef.current) return;
       autoPassedRef.current = true;
@@ -723,8 +720,18 @@ export default function GameRoom({
   // sitting there. The legacy `setActiveTurnSeatId(null|me)` paths
   // above still run for the mock / no-server flow — when
   // `serverDriven` is false this effect is a no-op.
+  //
+  // While the synthetic deal pulse (`localDealingPulse`) is running we
+  // intentionally do NOT propagate the server's `activeSeatId` into the
+  // UI: the backend collapses `ante → blind_betting` into a single
+  // broadcast, so without this gate the turn-ring + timer would pop in
+  // the moment the snapshot lands — before the local deal animation has
+  // finished. Once the pulse drops (~5.2s, see synthetic-pulse effect
+  // above) this effect re-runs and the ring appears together with the
+  // action bar.
   useEffect(() => {
     if (!serverDriven) return;
+    if (localDealingPulse) return;
     if (serverActiveSeatId === null) {
       setActiveTurnSeatId(null);
       return;
@@ -736,7 +743,7 @@ export default function GameRoom({
     }
     const localSeat = seats.find((s) => s.pos === anchor);
     setActiveTurnSeatId(localSeat?.id != null ? String(localSeat.id) : null);
-  }, [serverDriven, serverActiveSeatId, SEATID_TO_POS, seats]);
+  }, [serverDriven, serverActiveSeatId, SEATID_TO_POS, seats, localDealingPulse]);
 
   // Server-driven mode: reconcile `dealingDone` with the wire phase.
   //
@@ -957,6 +964,27 @@ export default function GameRoom({
   // once `setActiveTurnSeatId(String(me.id))` fires there.
   const isMyTurn =
     mySeatKey !== null && activeTurnSeatId !== null && activeTurnSeatId === mySeatKey;
+
+  // Turn-start audio cue + haptic — only for the local player. Other
+  // seats taking their turn should NOT trigger the chord on this
+  // device. Deduped against `lastTurnSoundIdRef` so the cue plays
+  // exactly once per fresh turn (StrictMode double-invoke, snapshot
+  // re-renders that re-fire the mirror effect, etc. all funnel through
+  // here without double-chiming).
+  useEffect(() => {
+    if (!activeTurnSeatId) {
+      lastTurnSoundIdRef.current = null;
+      return;
+    }
+    if (lastTurnSoundIdRef.current === activeTurnSeatId) return;
+    lastTurnSoundIdRef.current = activeTurnSeatId;
+    if (mySeatKey === null || activeTurnSeatId !== mySeatKey) return;
+    hapticTap();
+    if (audioRef.current?.soundRef.current) {
+      const ctx = audioRef.current.ensureCtx();
+      if (ctx) playTurnStartSound(ctx);
+    }
+  }, [activeTurnSeatId, mySeatKey]);
 
   const triggerBetFlight = useCallback((amount: number) => {
     if (mySeatId == null) return;
@@ -1330,7 +1358,10 @@ export default function GameRoom({
   // substitution, so trusting it against a real backend would award
   // the wrong seat the chips.
   useEffect(() => {
-    if (!showdown) return;
+    if (!showdown) {
+      winnerSweepStartedRef.current = null;
+      return;
+    }
     if (svaraSeatIds.size > 0) return;
 
     let winnerId: string | null = null;
@@ -1356,6 +1387,9 @@ export default function GameRoom({
       winnerId = winners[0].key;
     }
     if (winnerId === null) return;
+    // One sweep per winner per round — see `winnerSweepStartedRef` above.
+    if (winnerSweepStartedRef.current === winnerId) return;
+    winnerSweepStartedRef.current = winnerId;
     // Calculate pot. Prefer the local running tally (antes + bets booked
     // through `triggerBetFlight`) so the win badge matches the bank
     // readout that the player just watched tick down to 0. Falls back to a
